@@ -1,134 +1,126 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Entry point: canvas setup, game loop, screen transitions, shot mode.
+// ?shot=start|foot|drive|chase stages a deterministic scene and renders it.
+import { createWorld, updateWorld, resetWorld, wastePlayer, SCREEN_TITLE, SCREEN_PLAY, SCREEN_PAUSED, SCREEN_BUSTED, SCREEN_WASTED } from './world.js';
+import { renderWorld, renderTitle, renderOverlay, renderMapOverlay } from './render.js';
+import { createInput } from './input.js';
+import { createAudio } from './audio.js';
 import { stageShot } from './shots.js';
-
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+import { saveGame } from './save.js';
 
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const params = new URLSearchParams(location.search);
+const shotName = params.get('shot');
+const seedParam = Number(params.get('seed') || 20261117);
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
+const world = createWorld(seedParam, { ignoreSave: !!shotName });
+world.audio = createAudio();
+// Exposed for debugging / play-testing from the console.
+window.__solaraBay = world;
+const input = createInput();
+input.attach();
+
+let viewW = 1280;
+let viewH = 800;
+
+function resize() {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  viewW = window.innerWidth;
+  viewH = window.innerHeight;
+  canvas.width = Math.floor(viewW * dpr);
+  canvas.height = Math.floor(viewH * dpr);
+  canvas.style.width = `${viewW}px`;
+  canvas.style.height = `${viewH}px`;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  world.viewW = viewW;
+  world.viewH = viewH;
+}
+window.addEventListener('resize', resize);
+resize();
+
+let shotStaged = false;
+let last = performance.now();
+
+function setStatus(text) {
+  if (statusEl) statusEl.textContent = text;
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
-}
-
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
+function startMissionOrResume() {
+  if (world.screen === SCREEN_TITLE) {
+    world.screen = SCREEN_PLAY;
+    world.audio.unlock();
+    if (!world.missions.active && world.missions.available()) {
+      world.missions.start();
+      const def = world.missions.available();
+      if (def) {
+        world.messages.unshift({ text: def.briefing, t: 7 });
       }
-    } else {
-      accumulator = 0;
     }
-    renderer.draw(world.state, screen, best);
+    setStatus('Playing Solara Bay');
+  } else if (world.screen === SCREEN_BUSTED || world.screen === SCREEN_WASTED) {
+    world.screen = SCREEN_PLAY;
+    setStatus('Back on the streets of Solara Bay');
+  }
+}
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000 || 0.016);
+  last = now;
+
+  if (shotName && !shotStaged) {
+    shotStaged = true;
+    stageShot(shotName, world, updateWorld);
+    world.viewW = viewW;
+    world.viewH = viewH;
+  } else if (!shotName) {
+    if (input.wasPressed('enter')) {
+      if (world.screen === SCREEN_TITLE || world.screen === SCREEN_BUSTED || world.screen === SCREEN_WASTED) {
+        startMissionOrResume();
+      }
+    }
+    if (input.wasPressed('p') && world.screen === SCREEN_PLAY) {
+      world.screen = SCREEN_PAUSED;
+      setStatus('Paused');
+    } else if (input.wasPressed('p') && world.screen === SCREEN_PAUSED) {
+      world.screen = SCREEN_PLAY;
+      setStatus('Playing Solara Bay');
+    }
+    if (input.wasPressed('m')) {
+      const muted = world.audio.toggleMute();
+      world.messages.unshift({ text: muted ? 'Sound muted' : 'Sound on', t: 2 });
+    }
+    if (input.wasPressed('tab') && (world.screen === SCREEN_PLAY || world.screen === SCREEN_TITLE)) {
+      world.showMap = !world.showMap;
+    }
+    if (world.screen === SCREEN_PLAY) {
+      updateWorld(world, input, dt);
+      if (world.player.health <= 0 && world.screen === SCREEN_PLAY) wastePlayer(world);
+    } else if (world.screen === SCREEN_TITLE) {
+      world.time += dt;
+    }
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
+  if (world.screen === SCREEN_TITLE) renderTitle(ctx, world, viewW, viewH);
+  else if (world.screen === SCREEN_BUSTED) {
+    renderWorld(ctx, world, viewW, viewH);
+    renderOverlay(ctx, world, viewW, viewH, 'BUSTED', 'The Solara Bay PD caught up with Nia. Bail posted — $100 lost.');
+  } else if (world.screen === SCREEN_WASTED) {
+    renderWorld(ctx, world, viewW, viewH);
+    renderOverlay(ctx, world, viewW, viewH, 'WASTED', 'Nia is down. The crew drags her to Bayview Clinic.');
+  } else if (world.screen === SCREEN_PAUSED) {
+    renderWorld(ctx, world, viewW, viewH);
+    renderOverlay(ctx, world, viewW, viewH, 'PAUSED', 'Press P to keep driving.');
+  } else {
+    renderWorld(ctx, world, viewW, viewH);
+  }
+  if (world.showMap && (world.screen === SCREEN_PLAY || world.screen === SCREEN_TITLE)) {
+    renderMapOverlay(ctx, world, viewW, viewH);
+  }
 
-  announce('Block Dodger. Press Space or click to start.');
+  input.endFrame();
   requestAnimationFrame(frame);
 }
 
-if (shot) runShot(shot);
-else runGame();
+window.addEventListener('beforeunload', () => saveGame(world));
+requestAnimationFrame(frame);
